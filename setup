@@ -21,7 +21,6 @@ sed -ri 's/(\$wgLogo).*/\1 = \"\/wiki.png\";/' /var/www/LocalSettings.php
 echo 'require_once( "$IP/extensions/ParserFunctions/ParserFunctions.php" );' >> /var/www/LocalSettings.php
 echo 'require_once( "$IP/extensions/Scribunto/Scribunto.php" );' >> /var/www/LocalSettings.php
 echo 'require_once( "$IP/extensions/SyntaxHighlight_GeSHi/SyntaxHighlight_GeSHi.php" );' >> /var/www/LocalSettings.php
-echo 'require_once( "$IP/skins/MonoBook/MonoBook.php" );' >> /var/www/LocalSettings.php
 echo 'require_once( "$IP/skins/Vector/Vector.php" );' >> /var/www/LocalSettings.php
 convert $LOGO PNG:/var/www/wiki.png
 mogrify -resize 160x160 -background transparent -gravity center -extent 160x160 /var/www/wiki.png
