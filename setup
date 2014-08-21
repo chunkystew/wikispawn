@@ -1,0 +1,35 @@
+#!/bin/bash
+source ./envdata
+echo $DNS > /etc/hostname
+echo "grub-pc hold" | dpkg --set-selections # Because there is no spoon
+apt-key adv --recv-keys --keyserver hkp://keyserver.ubuntu.com:80 0xcbcb082a1bb943db
+add-apt-repository 'deb http://mirrors.syringanetworks.net/mariadb/repo/10.0/ubuntu trusty main'
+apt-get update
+apt-get -y upgrade
+debconf-set-selections <<< 'mariadb-server-10.0 mysql-server/root_password password maria'
+debconf-set-selections <<< 'mariadb-server-10.0 mysql-server/root_password_again password maria'
+apt-get -y install mariadb-server php5 php5-mysql php5-dev php-pear apache2 imagemagick g++ gcc automake autoconf m4 make libpcre3-dev re2c libicu-dev libmariadbclient-dev
+printf "\n" | pecl install intl
+sed -i '1i extension=intl.so' /etc/php5/apache2/php.ini
+rm -Rf /var/www/*
+chown -R root:root skel
+cp -R skel/* /
+service apache2 restart
+php /var/www/maintenance/install.php --server //$DNS --dbpass $(echo $RANDOM | md5sum | cut -d " " -f 1) --dbname mediawiki --dbuser wikiuser --installdbuser root --installdbpass maria --scriptpath "" --pass $SYSOP_PASS "$(echo $NAME | sed 's/_/ /g')" "WikiSysop"
+mysqladmin -u root -p'maria' password $(echo $RANDOM | md5sum | cut -d " " -f 1)
+sed -ri 's/(\$wgLogo).*/\1 = \"\/wiki.png\";/' /var/www/LocalSettings.php
+echo 'require_once( "$IP/extensions/ParserFunctions/ParserFunctions.php" );' >> /var/www/LocalSettings.php
+echo 'require_once( "$IP/extensions/Scribunto/Scribunto.php" );' >> /var/www/LocalSettings.php
+echo 'require_once( "$IP/extensions/SyntaxHighlight_GeSHi/SyntaxHighlight_GeSHi.php" );' >> /var/www/LocalSettings.php
+echo 'require_once( "$IP/skins/MonoBook/MonoBook.php" );' >> /var/www/LocalSettings.php
+echo 'require_once( "$IP/skins/Vector/Vector.php" );' >> /var/www/LocalSettings.php
+convert $LOGO PNG:/var/www/wiki.png
+mogrify -resize 160x160 -background transparent -gravity center -extent 160x160 /var/www/wiki.png
+convert /var/www/wiki.png -bordercolor white -border 0 \( -clone 0 -resize 16x16 \) \( -clone 0 -resize 32x32 \) \( -clone 0 -resize 48x48 \) \( -clone 0 -resize 64x64 \) -delete 0 -alpha off -colors 256 /var/www/favicon.ico
+chown -R www-data:www-data /var/www/*
+tar -xf bundle.tar
+php /var/www/maintenance/importDump.php export.xml
+tar -xf image.tar
+php /var/www/maintenance/importImages.php --overwrite ./
+rm -Rf *
+php /var/www/maintenance/rebuildrecentchanges.php
