@@ -1,0 +1,264 @@
+#!/bin/bash
+#
+# If you are reading this, you should know that this script is some hacker bullshit. Tread with caution.
+#
+die() {
+        [[ $1 ]] || {
+                printf >&2 -- 'Usage:\n\tdie <message> [return code]\n'
+        [[ $- == *i* ]] && return 1 || exit 1
+        }
+        printf >&2 -- '%s' "$1"
+        echo
+        exit ${2:-1}
+}
+CMD=$(basename "$0")
+EPOCH=$(date +%s)
+USAGE="\nWikiSpawn revision 21 Aug 2014\n
+Written by Matthew Saunier\n
+This code is released under the GPL, version 3 or later (at your option)\n
+\n
+Usage: $CMD [-c <category>] [-n <name>] [-l <logo file>]\n
+[-d <DNS name>] [-a <AMI ID>] [-t <instance type>] [-f] [-v -s]\n
+\n
+-c      The local MediaWiki category to synchronize with the new server.\n
+-n      The name of the new MediaWiki, as displayed on the main page.\n
+        This must be given in WikiText format, with underscores instead\n
+        of spaces.\n
+-l      An image file to use as the MediaWiki logo and favicon. This must\n
+        be in a format that ImageMagick can handle.\n
+-d      The DNS name of the new MediaWiki. This must be a FQDN, and the\n
+        domain specified must be a pre-existing Route 53 zone.\n
+-a      AMI ID of the image to use. Defaults to ami-6cc2a85c. Overriding\n
+        this can cause weird failures, you have been warned.\n
+-t      The instance type to create. Defaults to t2.micro.\n
+-f      Force VM creation, even if the DNS name specified already exists.\n
+-v      Maximum verbosity.\n
+-s      Run silently.\n
+-h      Display this summary.\n
+\n
+This script assumes that a working AWS API environment is present, and will\n
+fail if one is not.\n
+\n
+This script ALWAYS synchronizes MediaWiki namespaces 8 (MediaWiki),\n
+10 (Template), and 828 (Module), as they are needed for core functionality.\n"
+CATEGORY=""
+NAME=""
+LOGO=""
+DNS=""
+AMI_ID="ami-6cc2a85c" # Ubuntu 14.04 LTS EBS/HVM
+INSTANCE_TYPE="t2.micro"
+FORCE=0
+VERBOSITY=1 # Medium verbosity. 0 is silent, 2 is maximum
+if [ $# = 0 ] # No options were given
+then
+        echo -e $USAGE
+        exit 1
+fi
+while :
+do
+        case $1 in
+                -c)     CATEGORY=$2 ; shift ;;
+                -n)     NAME=$2 ; shift ;;
+                -l)     LOGO=$2 ; shift ;;
+                -d)     DNS=$2 ; shift ;;
+                -a)     AMI_ID=$2 ; shift ;;
+                -t)     INSTANCE_TYPE=$2 ; shift ;;
+                -h)     echo -e $USAGE ; exit 0 ;;
+                -f)     FORCE=1 ;;
+                -v)     VERBOSITY=2 ;;
+                -s)     VERBOSITY=0 ;;
+                -*)     echo "$CMD: unrecognised option: $1" >&2 ; exit 1 ;;
+                *)      break ;; # Time to quit
+        esac
+        shift
+done
+# Do some sanity checking here
+if [ "$CATEGORY" = "" ]; then
+        echo "$CMD: Category was not specified."
+        exit 1
+fi
+if [ "$NAME" = "" ]; then
+        echo "$CMD: MediaWiki name was not specified."
+        exit 1
+fi
+if [ "$LOGO" = "" ]; then
+        echo "$CMD: MediaWiki logo was not specified"
+        exit 1
+fi
+if [ "$DNS" = "" ]; then
+        echo "$CMD: DNS name was not specified."
+        exit 1
+fi
+if [ $(python r53mung -j ~/.aws-default/aws-credentials.json -z lark-it.com | cut -f 1 -d " " | grep ^$DNS$ | wc -l) -gt 0 ]; then
+        if [ $VERBOSITY -gt 0 ]; then
+                echo "$CMD: Checking for conflicting DNS entries..."
+        fi
+        if [ $FORCE -ne 1 ]; then
+                echo "$CMD: A DNS entry appears to exist for $DNS at Route 53 and -f was not specified."
+                exit 1
+        fi
+fi
+# Figure out some things about myself
+if [ $VERBOSITY -gt 0 ]; then
+        echo "$CMD: Gathering information about this instance..."
+fi
+EC2_INSTANCE_ID="`wget -q -O - http://169.254.169.254/latest/meta-data/instance-id || die \"ERROR: Cannot obtain instance ID.\"`"
+test -n "$EC2_INSTANCE_ID" || die "$CMD: Cannot obtain instance ID."
+if [ $VERBOSITY -gt 1 ]; then
+        echo "$CMD: My instance ID appears to be $EC2_INSTANCE_ID"
+fi
+EC2_AVAIL_ZONE="`wget -q -O - http://169.254.169.254/latest/meta-data/placement/availability-zone || die \"ERROR: Cannot obtain EC2 availability zone.\"`"
+test -n "$EC2_AVAIL_ZONE" || die "$CMD: Cannot obtain EC2 availability zone."
+if [ $VERBOSITY -gt 1 ]; then
+        echo "$CMD: My availability zone appears to be $EC2_AVAIL_ZONE"
+fi
+EC2_REGION="`echo \"$EC2_AVAIL_ZONE\" | sed -e 's:\([0-9][0-9]*\)[a-z]*\$:\\1:'`"
+if [ $VERBOSITY -gt 1 ]; then
+        echo "$CMD: My region appears to be $EC2_REGION"
+fi
+EC2_VPC=$(ec2-describe-instances | grep ^INSTANCE | grep $EC2_INSTANCE_ID | grep -Eo 'vpc-.*' | cut -f 1)
+test -n "$EC2_VPC" || die "$CMD: Cannot obtain EC2 VPC."
+if [ $VERBOSITY -gt 1 ]; then
+        echo "$CMD: My EC2 VPC appears to be $EC2_VPC"
+fi
+EC2_VPC_SUBNET=$(ec2-describe-instances | grep ^INSTANCE | grep $EC2_INSTANCE_ID | grep -Eo 'subnet-.*' | cut -f 1)
+test -n "$EC2_VPC_SUBNET" || die "$CMD: Cannot obtain VPC subnet."
+if [ $VERBOSITY -gt 1 ]; then
+        echo "$CMD: My VPC subnet appears to be $EC2_VPC_SUBNET"
+fi
+EC2_INTERNAL_IP=$(ec2-describe-instances | grep ^INSTANCE | grep $EC2_INSTANCE_ID | grep -Eo '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' | grep '^172')
+test -n "$EC2_INTERNAL_IP" || die "$CMD: Cannot obtain internal IP address."
+if [ $VERBOSITY -gt 1 ]; then
+        echo "$CMD: My internal IP appears to be $EC2_INTERNAL_IP"
+fi
+# Prepare a keypair and transmit public key to EC2
+if [ $VERBOSITY -gt 0 ]; then
+        echo "$CMD: Generating keypair and sending public key to EC2..."
+fi
+PRIVKEY=/tmp/$$$RANDOM
+PUBKEY=$PRIVKEY.pub
+ssh-keygen -t rsa -b 2048 -f $PRIVKEY -q -N ""
+KEY_NAME=$EPOCH-$DNS
+ec2-import-keypair $KEY_NAME -f $PUBKEY > /dev/null
+if [ $VERBOSITY -gt 1 ]; then
+        echo "$CMD: EC2 keypair name: $KEY_NAME"
+fi
+cat $PRIVKEY > ~/.ssh/$DNS.pem
+chmod 600 ~/.ssh/$DNS.pem
+rm -f $PUBKEY $PRIVKEY
+# Define a security group
+if [ $VERBOSITY -gt 0 ]; then
+        echo "$CMD: Creating a new security group..."
+fi
+GROUP_NAME=$EPOCH-$DNS
+EC2_SECURITY_GROUP=$(ec2-create-group $GROUP_NAME -d $DNS -c $EC2_VPC | cut -f 2)
+if [ $VERBOSITY -gt 1 ]; then
+        echo "$CMD: EC2 security group ID: $EC2_SECURITY_GROUP"
+fi
+ec2-authorize $EC2_SECURITY_GROUP -p 80 -P tcp > /dev/null
+ec2-authorize $EC2_SECURITY_GROUP -p 443 -P tcp > /dev/null
+ec2-authorize $EC2_SECURITY_GROUP -p 22 -P tcp -s $EC2_INTERNAL_IP/32  > /dev/null
+# Create an instance
+if [ $VERBOSITY -gt 0 ]; then
+        echo "$CMD: Starting a new EC2 instance..."
+fi
+EC2_CHILD_INSTANCE_ID=$(ec2-run-instances $AMI_ID -s $EC2_VPC_SUBNET -t $INSTANCE_TYPE --region $EC2_REGION --availability-zone $EC2_AVAIL_ZONE --key $KEY_NAME --group $EC2_SECURITY_GROUP --block-device-mapping /dev/sda1=:12 | grep ^INSTANCE)
+EC2_CHILD_INSTANCE_ID=$(python pygrep '(?:^.*\s)(i-[0-9,a-f]{8})(?:.*$)' "$EC2_CHILD_INSTANCE_ID")
+if [ $VERBOSITY -gt 1 ]; then
+        echo "$CMD: EC2 child instance ID: $EC2_CHILD_INSTANCE_ID"
+fi
+# Set up the DNS record at Route 53
+if [ $VERBOSITY -gt 0 ]; then
+        echo "$CMD: Creating DNS record..."
+fi
+if [ $VERBOSITY -gt 0 ]; then
+        echo "$CMD: Waiting a moment for IP assignment..."
+fi
+sleep 10
+EC2_CHILD_PUBLIC_IP=$(ec2-describe-instances | grep ^INSTANCE | grep $EC2_CHILD_INSTANCE_ID | awk 'gsub(/\s+/," ")' | cut -d " " -f 12)
+EC2_CHILD_PRIVATE_IP=$(ec2-describe-instances | grep ^INSTANCE | grep $EC2_CHILD_INSTANCE_ID | awk 'gsub(/\s+/," ")' | cut -d " " -f 13)
+if [ $VERBOSITY -gt 1 ]; then
+        echo "$CMD: EC2 child private IP: $EC2_CHILD_PRIVATE_IP"
+        echo "$CMD: EC2 child public IP: $EC2_CHILD_PUBLIC_IP"
+fi
+DOMAIN=$(python pygrep '(?:.*)(\..*?\..*?$)' $DNS)
+python r53mung -j ~/.aws-default/aws-credentials.json -z $DOMAIN -a $DNS -t A -d $EC2_CHILD_PUBLIC_IP -l 3600
+if [ $VERBOSITY -gt 0 ]; then
+        echo "$CMD: Creating MediaWiki export bundle..."
+fi
+WIKIDIR=/tmp/$$$RANDOM
+mkdir $WIKIDIR
+cp -R wikidata/* $WIKIDIR
+echo "export DNS=$DNS" >> $WIKIDIR/envdata
+echo "export NAME=$NAME" >> $WIKIDIR/envdata
+echo "export LOGO=$(basename $LOGO)" >> $WIKIDIR/envdata
+SYSOP_PASS=$(echo $RANDOM | md5sum | cut -d " " -f 1 | grep -Eo ^.{12})
+echo "export SYSOP_PASS=$SYSOP_PASS" >> $WIKIDIR/envdata
+chmod +x $WIKIDIR/envdata
+chmod +x $WIKIDIR/setup
+cp $LOGO $WIKIDIR/
+WIKIDATA=/tmp/$$$RANDOM
+./wikimung -p /var/www -c $CATEGORY -n 8 10 828 -o $WIKIDIR/bundle
+if [ $VERBOSITY -gt 0 ]; then
+        echo "$CMD: Compressing bundle..."
+fi
+tar -czf $WIKIDATA -C $WIKIDIR .
+rm -Rf $WIKIDIR
+if [ $VERBOSITY -gt 0 ]; then
+        echo "$CMD: Sending software to child instance..."
+fi
+scp -qri ~/.ssh/$DNS.pem -o StrictHostKeyChecking=no $WIKIDATA ubuntu@$EC2_CHILD_PRIVATE_IP:~/wikidata.tar.gz
+rm $WIKIDATA
+if [ $VERBOSITY -gt 0 ]; then
+        echo "$CMD: Logging in via SSH and setting up the environment..."
+fi
+# Create magic foo file to feed to ssh
+SETUPFOO=/tmp/$$$RANDOM
+echo "tar -xvzf wikidata.tar.gz" > $SETUPFOO
+echo "sudo ./setup" >> $SETUPFOO
+echo "sudo reboot" >> $SETUPFOO
+if [ $VERBOSITY -gt 1 ]; then
+        ssh -qi ~/.ssh/$DNS.pem ubuntu@$EC2_CHILD_PRIVATE_IP -o StrictHostKeyChecking=no < $SETUPFOO
+else
+        ssh -qi ~/.ssh/$DNS.pem ubuntu@$EC2_CHILD_PRIVATE_IP -o StrictHostKeyChecking=no < $SETUPFOO > /dev/null
+fi
+rm $SETUPFOO
+echo "$CMD: Child server set up and synchronized."
+if [ ! -d ~/sync ]; then
+        mkdir ~/sync
+fi
+# Here be dragons
+echo "#!/bin/bash" > ~/sync/$DNS
+echo "~/wikimung -p /var/www -c $CATEGORY -n 8 10 828 -b -o $DNS" >> ~/sync/$DNS
+echo "SFTPFOO=/tmp/\$$\$RANDOM" >> ~/sync/$DNS
+echo "echo \"put $DNS.tar.bz2\" >> \$SFTPFOO" >> ~/sync/$DNS
+echo "echo \"bye\" >> \$SFTPFOO" >> ~/sync/$DNS
+echo "sftp -qi ~/.ssh/$DNS.pem -b \$SFTPFOO -o StrictHostKeyChecking=no ubuntu@$EC2_CHILD_PRIVATE_IP" >> ~/sync/$DNS
+echo "rm \$SFTPFOO" >> ~/sync/$DNS
+# Van chase
+echo "SSHFOO=/tmp/\$$\$RANDOM" >> ~/sync/$DNS
+# The hotel
+echo "echo \"tar -xjf $DNS.tar.bz2\" >> \$SSHFOO" >> ~/sync/$DNS
+echo "echo \"rm $DNS.tar.bz2\" >> \$SSHFOO" >> ~/sync/$DNS
+echo "echo \"php /var/www/maintenance/importDump.php export.xml\" >> \$SSHFOO" >> ~/sync/$DNS
+echo "echo \"rm export.xml\" >> \$SSHFOO" >> ~/sync/$DNS
+echo "echo \"tar -xf image.tar\" >> \$SSHFOO" >> ~/sync/$DNS
+echo "echo \"rm image.tar\" >> \$SSHFOO" >> ~/sync/$DNS
+echo "echo \"php /var/www/maintenance/importImages.php --overwrite ./\" >> \$SSHFOO" >> ~/sync/$DNS
+echo "echo \"rm *\" >> \$SSHFOO" >> ~/sync/$DNS
+echo "echo \"php /var/www/maintenance/rebuildrecentchanges.php\" >> \$SSHFOO" >> ~/sync/$DNS
+# Snow fortress
+echo "ssh -qi ~/.ssh/$DNS.pem ubuntu@$EC2_CHILD_PRIVATE_IP -o StrictHostKeyChecking=no < \$SSHFOO" >> ~/sync/$DNS
+echo "rm \$SSHFOO" >> ~/sync/$DNS
+chmod +x ~/sync/$DNS
+# Pick a random time between 0:00 and 3:59 every day to sync. Multiple synchronizations at the same time aren't a problem, but why not try to avoid it?
+SYNCHOUR=$(echo "$RANDOM % 4" | bc)
+SYNCMINUTE=$(echo "$RANDOM % 60" | bc)
+OLDCRON=/tmp/$$$RANDOM
+NEWCRON=/tmp/$$$RANDOM
+crontab -l > $OLDCRON
+grep -v $DNS $OLDCRON > $NEWCRON
+echo "$SYNCMINUTE $SYNCHOUR * * * ~/sync/$DNS #$DNS" >> $NEWCRON
+crontab $NEWCRON
+rm $OLDCRON $NEWCRON
+echo "$CMD: Generated password for WikiSysop: $SYSOP_PASS"
